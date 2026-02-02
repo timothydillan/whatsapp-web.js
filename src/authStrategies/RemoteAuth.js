@@ -104,16 +104,22 @@ class RemoteAuth extends BaseAuthStrategy {
     async storeRemoteSession(options) {
         /* Compress & Store Session */
         const pathExists = await this.isValidPath(this.userDataDir);
-        if (pathExists) {
-            await this.compressSession();
+        if (!pathExists) return;
+
+        let compressedSessionPath;
+        try {
+            compressedSessionPath = await this.compressSession();
             await this.store.save({session: path.join(this.dataPath, this.sessionName)});
-            await fs.promises.unlink(path.join(this.dataPath, `${this.sessionName}.zip`));
-            await fs.promises.rm(`${this.tempDir}`, {
-                recursive: true,
-                force: true,
-                maxRetries: this.rmMaxRetries,
-            }).catch(() => {});
             if(options && options.emit) this.client.emit(Events.REMOTE_SESSION_SAVED);
+        } finally {
+            await Promise.allSettled([
+                compressedSessionPath ? fs.promises.unlink(compressedSessionPath).catch(() => {}) : Promise.resolve(),
+                fs.promises.rm(this.tempDir, {
+                    recursive: true,
+                    force: true,
+                    maxRetries: this.rmMaxRetries,
+                }).catch(() => {})
+            ]);
         }
     }
 
@@ -143,17 +149,19 @@ class RemoteAuth extends BaseAuthStrategy {
 
     async compressSession() {
         const archive = archiver('zip');
-        const stream = fs.createWriteStream(path.join(this.dataPath, `${this.sessionName}.zip`));
+        const outputPath = path.join(this.dataPath, `${this.sessionName}.zip`);
+        const stream = fs.createWriteStream(outputPath);
 
-        await fs.copy(this.userDataDir, this.tempDir).catch(() => {});
-        await this.deleteMetadata();
+        await this.copyByRequiredDirs();
         return new Promise((resolve, reject) => {
+            archive.on('error', err => reject(err));
+            stream.on('error', err => reject(err));
+            stream.on('close', () => resolve(outputPath));
+
             archive
                 .directory(this.tempDir, false)
-                .on('error', err => reject(err))
                 .pipe(stream);
 
-            stream.on('close', () => resolve());
             archive.finalize();
         });
     }
@@ -171,25 +179,15 @@ class RemoteAuth extends BaseAuthStrategy {
         await fs.promises.unlink(compressedSessionPath);
     }
 
-    async deleteMetadata() {
-        const sessionDirs = [this.tempDir, path.join(this.tempDir, 'Default')];
-        for (const dir of sessionDirs) {
-            const sessionFiles = await fs.promises.readdir(dir);
-            for (const element of sessionFiles) {
-                if (!this.requiredDirs.includes(element)) {
-                    const dirElement = path.join(dir, element);
-                    const stats = await fs.promises.lstat(dirElement);
-    
-                    if (stats.isDirectory()) {
-                        await fs.promises.rm(dirElement, {
-                            recursive: true,
-                            force: true,
-                            maxRetries: this.rmMaxRetries,
-                        }).catch(() => {});
-                    } else {
-                        await fs.promises.unlink(dirElement).catch(() => {});
-                    }
-                }
+    async copyByRequiredDirs() {
+        const nativeFs = require('fs');
+        await nativeFs.promises.mkdir(this.tempDir, { recursive: true });
+        for (const dir of this.requiredDirs) {
+            const srcDir = path.join(this.userDataDir, dir);
+            const destDir = path.join(this.tempDir, dir);
+            const exists = await this.isValidPath(srcDir);
+            if (exists) {
+                await nativeFs.promises.cp(srcDir, destDir, { recursive: true });
             }
         }
     }
