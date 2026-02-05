@@ -382,7 +382,13 @@ class Client extends EventEmitter {
                 window.AuthStore.Cmd.on('offline_progress_update', () => {
                     window.onOfflineProgressUpdateEvent(window.AuthStore.OfflineMessageHandler.getOfflineDeliveryProgress());
                 });
+                window.AuthStore.Cmd.on('offline_progress_update_from_bridge', () => {
+                    window.onOfflineProgressUpdateEvent(window.AuthStore.OfflineMessageHandler.getOfflineDeliveryProgress());
+                });
                 window.AuthStore.Cmd.on('logout', async () => {
+                    await window.onLogoutEvent();
+                });
+                window.AuthStore.Cmd.on('logout_from_bridge', async () => {
                     await window.onLogoutEvent();
                 });
             });
