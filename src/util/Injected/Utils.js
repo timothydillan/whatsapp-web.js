@@ -1044,8 +1044,32 @@ exports.LoadUtils = () => {
                 .value
                 .addParticipantsParticipantMixins;
         } catch (err) {
-            data.code = 400;
-            return data;
+            if (String(err?.message || err).toLowerCase().includes('lid')) {
+                try {
+                    const query = window.require('WAWebContactSyncUtils').constructUsyncDeltaQuery([{
+                        type: 'add',
+                        phoneNumber: participantWid.user
+                    }]);
+                    const result = await query.execute();
+                    if (result?.list?.[0]?.lid) {
+                        const resolvedLid = window.Store.WidFactory.createWid(result.list[0].lid);
+                        const resolvedArgs = [{
+                            participantJid: window.Store.WidToJid.widToUserJid(resolvedLid)
+                        }];
+                        rpcResult = await window.Store.GroupParticipants.sendAddParticipantsRPC({ participantArgs: resolvedArgs, iqTo });
+                        resultArgs = rpcResult.value.addParticipant[0]
+                            .addParticipantsParticipantAddedOrNonRegisteredWaUserParticipantErrorLidResponseMixinGroup
+                            .value
+                            .addParticipantsParticipantMixins;
+                    }
+                } catch {
+                    // LID resolution or retry failed
+                }
+            }
+            if (!rpcResult) {
+                data.code = 400;
+                return data;
+            }
         }
 
         if (rpcResult.name === 'AddParticipantsResponseSuccess') {
