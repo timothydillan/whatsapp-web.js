@@ -154,11 +154,14 @@ class Contact extends Base {
     async block() {
         if(this.isGroup) return false;
 
-        await this.client.pupPage.evaluate(async (contactId) => {
+        const success = await this.client.pupPage.evaluate(async (contactId) => {
             const contact = window.Store.Contact.get(contactId);
+            if (!contact) return false;
             await window.Store.BlockContact.blockContact({contact});
+            return true;
         }, this.id._serialized);
 
+        if (!success) return false;
         this.isBlocked = true;
         return true;
     }
@@ -170,11 +173,14 @@ class Contact extends Base {
     async unblock() {
         if(this.isGroup) return false;
 
-        await this.client.pupPage.evaluate(async (contactId) => {
+        const success = await this.client.pupPage.evaluate(async (contactId) => {
             const contact = window.Store.Contact.get(contactId);
+            if (!contact) return false;
             await window.Store.BlockContact.unblockContact(contact);
+            return true;
         }, this.id._serialized);
 
+        if (!success) return false;
         this.isBlocked = false;
         return true;
     }

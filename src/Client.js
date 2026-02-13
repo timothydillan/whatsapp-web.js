@@ -459,14 +459,37 @@ class Client extends EventEmitter {
         await this.inject();
 
         this.pupPage.on('framenavigated', async (frame) => {
-            if(frame.url().includes('post_logout=1') || this.lastLoggedOut) {
-                this.emit(Events.DISCONNECTED, 'LOGOUT');
-                await this.authStrategy.logout();
-                await this.authStrategy.beforeBrowserInitialized();
-                await this.authStrategy.afterBrowserInitialized();
-                this.lastLoggedOut = false;
+            try {
+                if(frame.url().includes('post_logout=1') || this.lastLoggedOut) {
+                    this.emit(Events.DISCONNECTED, 'LOGOUT');
+                    await this.authStrategy.logout();
+                    await this.authStrategy.beforeBrowserInitialized();
+                    await this.authStrategy.afterBrowserInitialized();
+                    this.lastLoggedOut = false;
+                }
+                await this.inject();
+
+                // Re-attach message event listeners if session was already ready.
+                // Page navigation clears the page context, destroying Store.Msg listeners.
+                if (this._readyEmitted) {
+                    const storeAvailable = await this.pupPage.evaluate(() => {
+                        return typeof window.Store !== 'undefined' && typeof window.WWebJS !== 'undefined';
+                    }).catch(() => false);
+
+                    if (storeAvailable) {
+                        await this.attachEventListeners();
+                    }
+                }
+            } catch (err) {
+                // Prevent unhandled rejections from silently killing the session.
+                // Without this, a failed inject() or attachEventListeners() leaves the
+                // session connected but unable to receive messages ("zombie state").
+                console.error('[wwebjs] framenavigated handler error:', err.message || err);
             }
-            await this.inject();
+        });
+
+        this.pupPage.on('error', (err) => {
+            console.error('[wwebjs] Page error:', err.message);
         });
     }
 
@@ -841,47 +864,56 @@ class Client extends EventEmitter {
                 return;
             }
 
+            // Prevent duplicate listeners in same page context.
+            // Flag auto-resets on navigation (page context clears window.*).
+            if (window._messageListenersRegistered) return;
+            window._messageListenersRegistered = true;
+
             // Message event listeners
+            // Each callback is wrapped in try-catch so a single error doesn't kill
+            // the entire listener chain, which would cause a zombie session.
             if (window.Store.Msg) {
-                window.Store.Msg.on('change', (msg) => { window.onChangeMessageEvent(window.WWebJS.getMessageModel(msg)); });
-                window.Store.Msg.on('change:type', (msg) => { window.onChangeMessageTypeEvent(window.WWebJS.getMessageModel(msg)); });
-                window.Store.Msg.on('change:ack', (msg, ack) => { window.onMessageAckEvent(window.WWebJS.getMessageModel(msg), ack); });
-                window.Store.Msg.on('change:isUnsentMedia', (msg, unsent) => { if (msg.id.fromMe && !unsent) window.onMessageMediaUploadedEvent(window.WWebJS.getMessageModel(msg)); });
-                window.Store.Msg.on('remove', (msg) => { if (msg.isNewMsg) window.onRemoveMessageEvent(window.WWebJS.getMessageModel(msg)); });
-                window.Store.Msg.on('change:body change:caption', (msg, newBody, prevBody) => { window.onEditMessageEvent(window.WWebJS.getMessageModel(msg), newBody, prevBody); });
+                window.Store.Msg.on('change', (msg) => { try { window.onChangeMessageEvent(window.WWebJS.getMessageModel(msg)); } catch(e) { console.error('[wwebjs] change handler error:', e); } });
+                window.Store.Msg.on('change:type', (msg) => { try { window.onChangeMessageTypeEvent(window.WWebJS.getMessageModel(msg)); } catch(e) { console.error('[wwebjs] change:type handler error:', e); } });
+                window.Store.Msg.on('change:ack', (msg, ack) => { try { window.onMessageAckEvent(window.WWebJS.getMessageModel(msg), ack); } catch(e) { console.error('[wwebjs] change:ack handler error:', e); } });
+                window.Store.Msg.on('change:isUnsentMedia', (msg, unsent) => { try { if (msg.id.fromMe && !unsent) window.onMessageMediaUploadedEvent(window.WWebJS.getMessageModel(msg)); } catch(e) { console.error('[wwebjs] change:isUnsentMedia handler error:', e); } });
+                window.Store.Msg.on('remove', (msg) => { try { if (msg.isNewMsg) window.onRemoveMessageEvent(window.WWebJS.getMessageModel(msg)); } catch(e) { console.error('[wwebjs] remove handler error:', e); } });
+                window.Store.Msg.on('change:body change:caption', (msg, newBody, prevBody) => { try { window.onEditMessageEvent(window.WWebJS.getMessageModel(msg), newBody, prevBody); } catch(e) { console.error('[wwebjs] edit handler error:', e); } });
                 window.Store.Msg.on('add', (msg) => {
-                    if (msg.isNewMsg) {
-                        if(msg.type === 'ciphertext') {
-                            // defer message event until ciphertext is resolved (type changed)
-                            msg.once('change:type', (_msg) => window.onAddMessageEvent(window.WWebJS.getMessageModel(_msg)));
-                            window.onAddMessageCiphertextEvent(window.WWebJS.getMessageModel(msg));
-                        } else {
-                            window.onAddMessageEvent(window.WWebJS.getMessageModel(msg));
+                    try {
+                        if (msg.isNewMsg) {
+                            if(msg.type === 'ciphertext') {
+                                // defer message event until ciphertext is resolved (type changed)
+                                msg.once('change:type', (_msg) => { try { window.onAddMessageEvent(window.WWebJS.getMessageModel(_msg)); } catch(e) { console.error('[wwebjs] ciphertext resolve error:', e); } });
+                                window.onAddMessageCiphertextEvent(window.WWebJS.getMessageModel(msg));
+                            } else {
+                                window.onAddMessageEvent(window.WWebJS.getMessageModel(msg));
+                            }
                         }
-                    }
+                    } catch(e) { console.error('[wwebjs] add handler error:', e); }
                 });
             }
 
             // App state listener
             if (window.Store.AppState) {
-                window.Store.AppState.on('change:state', (_AppState, state) => { window.onAppStateChangedEvent(state); });
+                window.Store.AppState.on('change:state', (_AppState, state) => { try { window.onAppStateChangedEvent(state); } catch(e) { console.error('[wwebjs] app state change error:', e); } });
             }
 
             // Connection/battery listener
             if (window.Store.Conn) {
-                window.Store.Conn.on('change:battery', (state) => { window.onBatteryStateChangedEvent(state); });
+                window.Store.Conn.on('change:battery', (state) => { try { window.onBatteryStateChangedEvent(state); } catch(e) { console.error('[wwebjs] battery state error:', e); } });
             }
 
             // Incoming call listener
             if (window.Store.Call) {
-                window.Store.Call.on('add', (call) => { window.onIncomingCall(call); });
+                window.Store.Call.on('add', (call) => { try { window.onIncomingCall(call); } catch(e) { console.error('[wwebjs] incoming call error:', e); } });
             }
 
             // Chat event listeners
             if (window.Store.Chat) {
-                window.Store.Chat.on('remove', async (chat) => { window.onRemoveChatEvent(await window.WWebJS.getChatModel(chat)); });
-                window.Store.Chat.on('change:archive', async (chat, currState, prevState) => { window.onArchiveChatEvent(await window.WWebJS.getChatModel(chat), currState, prevState); });
-                window.Store.Chat.on('change:unreadCount', (chat) => {window.onChatUnreadCountEvent(chat);});
+                window.Store.Chat.on('remove', async (chat) => { try { window.onRemoveChatEvent(await window.WWebJS.getChatModel(chat)); } catch(e) { console.error('[wwebjs] chat remove error:', e); } });
+                window.Store.Chat.on('change:archive', async (chat, currState, prevState) => { try { window.onArchiveChatEvent(await window.WWebJS.getChatModel(chat), currState, prevState); } catch(e) { console.error('[wwebjs] chat archive error:', e); } });
+                window.Store.Chat.on('change:unreadCount', (chat) => { try { window.onChatUnreadCountEvent(chat); } catch(e) { console.error('[wwebjs] unread count error:', e); } });
             }
 
             // Reaction and poll vote listeners - version dependent
@@ -890,15 +922,19 @@ class Client extends EventEmitter {
                     const module = window.Store.AddonReactionTable;
                     const ogMethod = module.bulkUpsert;
                     module.bulkUpsert = ((...args) => {
-                        window.onReaction(args[0].map(reaction => {
-                            const msgKey = reaction.id;
-                            const parentMsgKey = reaction.reactionParentKey;
-                            const timestamp = reaction.reactionTimestamp / 1000;
-                            const sender = reaction.author ?? reaction.from;
-                            const senderUserJid = sender._serialized;
+                        try {
+                            window.onReaction(args[0].map(reaction => {
+                                const msgKey = reaction.id;
+                                const parentMsgKey = reaction.reactionParentKey;
+                                const timestamp = reaction.reactionTimestamp / 1000;
+                                const sender = reaction.author ?? reaction.from;
+                                const senderUserJid = sender._serialized;
 
-                            return {...reaction, msgKey, parentMsgKey, senderUserJid, timestamp };
-                        }));
+                                return {...reaction, msgKey, parentMsgKey, senderUserJid, timestamp };
+                            }));
+                        } catch(e) {
+                            console.error('[wwebjs] reaction handler error:', e);
+                        }
 
                         return ogMethod(...args);
                     }).bind(module);
@@ -909,31 +945,35 @@ class Client extends EventEmitter {
                     const ogPollVoteMethod = pollVoteModule.bulkUpsert;
 
                     pollVoteModule.bulkUpsert = (async (...args) => {
-                        const votes = await Promise.all(args[0].map(async vote => {
-                            const msgKey = vote.id;
-                            const parentMsgKey = vote.pollUpdateParentKey;
-                            const timestamp = vote.t / 1000;
-                            const sender = vote.author ?? vote.from;
-                            const senderUserJid = sender._serialized;
+                        try {
+                            const votes = await Promise.all(args[0].map(async vote => {
+                                const msgKey = vote.id;
+                                const parentMsgKey = vote.pollUpdateParentKey;
+                                const timestamp = vote.t / 1000;
+                                const sender = vote.author ?? vote.from;
+                                const senderUserJid = sender._serialized;
 
-                            let parentMessage = window.Store.Msg.get(parentMsgKey._serialized);
-                            if (!parentMessage) {
-                                const fetched = await window.Store.Msg.getMessagesById([parentMsgKey._serialized]);
-                                parentMessage = fetched?.messages?.[0] || null;
-                            }
+                                let parentMessage = window.Store.Msg.get(parentMsgKey._serialized);
+                                if (!parentMessage) {
+                                    const fetched = await window.Store.Msg.getMessagesById([parentMsgKey._serialized]);
+                                    parentMessage = fetched?.messages?.[0] || null;
+                                }
 
-                            return {
-                                ...vote,
-                                msgKey,
-                                sender,
-                                parentMsgKey,
-                                senderUserJid,
-                                timestamp,
-                                parentMessage
-                            };
-                        }));
+                                return {
+                                    ...vote,
+                                    msgKey,
+                                    sender,
+                                    parentMsgKey,
+                                    senderUserJid,
+                                    timestamp,
+                                    parentMessage
+                                };
+                            }));
 
-                        window.onPollVoteEvent(votes);
+                            window.onPollVoteEvent(votes);
+                        } catch(e) {
+                            console.error('[wwebjs] poll vote handler error:', e);
+                        }
 
                         return ogPollVoteMethod.apply(pollVoteModule, args);
                     }).bind(pollVoteModule);
@@ -943,13 +983,17 @@ class Client extends EventEmitter {
                     const module = window.Store.createOrUpdateReactionsModule;
                     const ogMethod = module.createOrUpdateReactions;
                     module.createOrUpdateReactions = ((...args) => {
-                        window.onReaction(args[0].map(reaction => {
-                            const msgKey = window.Store.MsgKey.fromString(reaction.msgKey);
-                            const parentMsgKey = window.Store.MsgKey.fromString(reaction.parentMsgKey);
-                            const timestamp = reaction.timestamp / 1000;
+                        try {
+                            window.onReaction(args[0].map(reaction => {
+                                const msgKey = window.Store.MsgKey.fromString(reaction.msgKey);
+                                const parentMsgKey = window.Store.MsgKey.fromString(reaction.parentMsgKey);
+                                const timestamp = reaction.timestamp / 1000;
 
-                            return {...reaction, msgKey, parentMsgKey, timestamp };
-                        }));
+                                return {...reaction, msgKey, parentMsgKey, timestamp };
+                            }));
+                        } catch(e) {
+                            console.error('[wwebjs] legacy reaction handler error:', e);
+                        }
 
                         return ogMethod(...args);
                     }).bind(module);
@@ -1363,13 +1407,14 @@ class Client extends EventEmitter {
     /**
      * Get contact instance by ID
      * @param {string} contactId
-     * @returns {Promise<Contact>}
+     * @returns {Promise<?Contact>}
      */
     async getContactById(contactId) {
         let contact = await this.pupPage.evaluate(contactId => {
             return window.WWebJS.getContact(contactId);
         }, contactId);
 
+        if (!contact) return null;
         return ContactFactory.create(this, contact);
     }
 

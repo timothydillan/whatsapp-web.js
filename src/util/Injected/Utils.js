@@ -149,6 +149,7 @@ exports.LoadUtils = () => {
         let vcardOptions = {};
         if (options.contactCard) {
             let contact = window.Store.Contact.get(options.contactCard);
+            if (!contact) throw new Error('Contact not found for contactCard: ' + options.contactCard);
             vcardOptions = {
                 body: window.Store.VCard.vcardFromContactModel(contact).vcard,
                 type: 'vcard',
@@ -156,7 +157,8 @@ exports.LoadUtils = () => {
             };
             delete options.contactCard;
         } else if (options.contactCardList) {
-            let contacts = options.contactCardList.map(c => window.Store.Contact.get(c));
+            let contacts = options.contactCardList.map(c => window.Store.Contact.get(c)).filter(Boolean);
+            if (contacts.length === 0) throw new Error('No valid contacts found in contactCardList');
             let vcards = contacts.map(c => window.Store.VCard.vcardFromContactModel(c));
             vcardOptions = {
                 type: 'multi_vcard',
@@ -434,7 +436,10 @@ exports.LoadUtils = () => {
             blob: file,
             type: 'sticker',
             signal: controller.signal,
-            mediaKey
+            mediaKey,
+            uploadQpl: window.Store.MediaUpload.startMediaUploadQpl({
+                entryPoint: 'MediaUpload'
+            }),
         });
 
         const stickerInfo = {
@@ -725,12 +730,54 @@ exports.LoadUtils = () => {
 
     window.WWebJS.getContact = async contactId => {
         const wid = window.Store.WidFactory.createWid(contactId);
-        let contact = await window.Store.Contact.find(wid);
-        if (contact.id._serialized.endsWith('@lid')) {
+
+        // Tier 1: Sync cache lookup (fast path)
+        let contact = window.Store.Contact.get(wid);
+
+        // Tier 2: Async server fetch with error handling
+        if (!contact) {
+            try {
+                contact = await window.Store.Contact.find(wid);
+            } catch (_) {
+                // find() can throw on server errors (e.g., HTTP 400) — continue with null
+            }
+        }
+
+        // Tier 3: LID resolution for unsynced contacts (same pattern as getChat)
+        if (!contact) {
+            try {
+                const query = window.require('WAWebContactSyncUtils').constructUsyncDeltaQuery([{
+                    type: 'add',
+                    phoneNumber: wid.user
+                }]);
+                const result = await query.execute();
+                if (result?.list?.[0]?.lid) {
+                    const contactLid = window.Store.WidFactory.createWid(result.list[0].lid);
+                    contact = window.Store.Contact.get(contactLid)
+                        || await window.Store.Contact.find(contactLid).catch(() => null);
+                }
+            } catch (_) {
+                // LID resolution failed — contact remains null
+            }
+        }
+
+        if (!contact) return null;
+
+        // Safe LID-to-phone resolution (guard against undefined phoneNumber per PR #5663)
+        if (contact.id?._serialized?.endsWith('@lid') && contact.phoneNumber) {
             contact.id = contact.phoneNumber;
         }
-        const bizProfile = await window.Store.BusinessProfile.fetchBizProfile(wid);
-        bizProfile.profileOptions && (contact.businessProfile = bizProfile);
+
+        // Business profile is non-essential metadata
+        try {
+            const bizProfile = await window.Store.BusinessProfile.fetchBizProfile(wid);
+            if (bizProfile?.profileOptions) {
+                contact.businessProfile = bizProfile;
+            }
+        } catch (_) {
+            // fetchBizProfile failed — proceed without it
+        }
+
         return window.WWebJS.getContactModel(contact);
     };
 
